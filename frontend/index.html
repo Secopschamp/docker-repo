@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>GitHub Token</title>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 2em; }
+    .token { font-family: monospace; background: #f4f4f4; padding: 0.5em; border-radius: 5px; }
+    button { margin-top: 1em; padding: 0.5em 1em; }
+    .warning { color: #b00020; margin-top: 1em; }
+  </style>
+</head>
+<body>
+  <h1>GitHub Token Viewer</h1>
+
+  <p>
+    <strong>Access Token:</strong>
+    <span class="token" id="masked-token">********</span>
+  </p>
+
+  <p>
+    <strong>Token expires in:</strong>
+    <span id="countdown">--:--:--</span>
+  </p>
+
+  <button id="reveal-btn">Reveal token (one-time)</button>
+  <p class="warning">⚠️ Token will be shown once and expire shortly after reveal.</p>
+
+  <script>
+    let expiry = 0;
+
+    async function loadToken() {
+      const res = await fetch('/token-data');
+      if (!res.ok) return;
+
+      const data = await res.json();
+      document.getElementById('masked-token').textContent = data.masked_token;
+      expiry = data.expiry;
+
+      if (data.revealed) {
+        document.getElementById('reveal-btn').disabled = true;
+        document.getElementById('reveal-btn').textContent = 'Token already revealed';
+      }
+    }
+
+    function updateCountdown() {
+      if (!expiry) return;
+      const diff = expiry - Date.now();
+      document.getElementById('countdown').textContent =
+        diff <= 0 ? 'Expired' :
+        new Date(diff).toISOString().substr(11, 8);
+    }
+
+    document.getElementById('reveal-btn').onclick = async () => {
+      if (!confirm("Reveal token once? It will expire shortly.")) return;
+
+      const res = await fetch('/token/reveal', { method: 'POST' });
+      if (!res.ok) return alert("Token cannot be revealed again");
+
+      const { access_token } = await res.json();
+      await navigator.clipboard.writeText(access_token);
+      alert("Token copied to clipboard");
+
+      document.getElementById('reveal-btn').disabled = true;
+    };
+
+    loadToken();
+    setInterval(updateCountdown, 1000);
+  </script>
+</body>
+</html>
