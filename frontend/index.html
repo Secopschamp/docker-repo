@@ -24,14 +24,17 @@
   </p>
 
   <button id="reveal-btn">Reveal token (one-time)</button>
-  <p class="warning">⚠️ Token will be shown once and expire shortly after reveal.</p>
+  <p class="warning">⚠️ Token expires exactly 2 hours after generation.</p>
 
   <script>
     let expiry = 0;
 
     async function loadToken() {
       const res = await fetch('/token-data');
-      if (!res.ok) return;
+      if (!res.ok) {
+        document.getElementById('countdown').textContent = 'Expired';
+        return;
+      }
 
       const data = await res.json();
       document.getElementById('masked-token').textContent = data.masked_token;
@@ -47,15 +50,17 @@
       if (!expiry) return;
       const diff = expiry - Date.now();
       document.getElementById('countdown').textContent =
-        diff <= 0 ? 'Expired' :
-        new Date(diff).toISOString().substr(11, 8);
+        diff <= 0 ? 'Expired' : new Date(diff).toISOString().substr(11, 8);
     }
 
     document.getElementById('reveal-btn').onclick = async () => {
-      if (!confirm("Reveal token once? It will expire shortly.")) return;
+      if (!confirm("Reveal token once? It will be copied to clipboard.")) return;
 
       const res = await fetch('/token/reveal', { method: 'POST' });
-      if (!res.ok) return alert("Token cannot be revealed again");
+      if (!res.ok) {
+        alert("Token cannot be revealed");
+        return;
+      }
 
       const { access_token } = await res.json();
       await navigator.clipboard.writeText(access_token);

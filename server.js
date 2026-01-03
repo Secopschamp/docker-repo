@@ -13,12 +13,16 @@ app.use(express.json());
 
 const PORT = 8080;
 const ORG_NAME = process.env.GITHUB_ORG;
-const TOKEN_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
-const REVEAL_TTL_MS = 15 * 60 * 1000;   // 15 minutes after reveal
+
+// const TOKEN_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours (HARD STOP)
+const TOKEN_TTL_MS = 2 * 60 * 1000; // 2 minutes (TESTING)
+
+// const REVEAL_TTL_MS = 15 * 60 * 1000;   // optional post-reveal window
+const REVEAL_TTL_MS = 2 * 60 * 1000; // 2 minutes (TESTING)
 const isProduction = false;
 
 /* ------------------------ In-memory store ------------------------ */
-// session_id -> { token, expiry, revealed }
+// session_id -> { token, expiry, revealed, revealExpiry }
 const sessionTokens = new Map();
 
 /* ------------------------ Utilities ------------------------ */
@@ -34,7 +38,30 @@ function maskToken(token) {
   return token ? token.slice(0, -8) + "*".repeat(8) : "********";
 }
 
-/* ------------------------ Org validation ------------------------ */
+/* ------------------------ GitHub helpers ------------------------ */
+async function revokeGithubToken(token) {
+  try {
+    await fetch(
+      `https://api.github.com/applications/${process.env.GITHUB_CLIENT_ID}/token`,
+      {
+        method: "DELETE",
+        headers: {
+          Accept: "application/vnd.github+json",
+          Authorization:
+            "Basic " +
+            Buffer.from(
+              `${process.env.GITHUB_CLIENT_ID}:${process.env.GITHUB_CLIENT_SECRET}`
+            ).toString("base64"),
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ access_token: token })
+      }
+    );
+  } catch (err) {
+    console.error("Failed to revoke token:", err.message);
+  }
+}
+
 async function validateOrgMembership(token) {
   const res = await fetch("https://api.github.com/user/memberships/orgs", {
     headers: {
@@ -51,13 +78,34 @@ async function validateOrgMembership(token) {
   );
 }
 
+/* ------------------------ Central session validator ------------------------ */
+async function getValidSession(req) {
+  const sessionId = req.cookies.session_id;
+  const session = sessionTokens.get(sessionId);
+  if (!session) return null;
+
+  const now = Date.now();
+
+  if (
+    session.expiry <= now ||
+    (session.revealed && session.revealExpiry && session.revealExpiry <= now)
+  ) {
+    await revokeGithubToken(session.token);
+    sessionTokens.delete(sessionId);
+    return null;
+  }
+
+  return session;
+}
+
 /* ------------------------ Root ------------------------ */
 app.get("/", async (req, res) => {
-  const session = sessionTokens.get(req.cookies.session_id);
+  const session = await getValidSession(req);
 
-  if (session && session.expiry > Date.now()) {
+  if (session) {
     const stillMember = await validateOrgMembership(session.token);
     if (!stillMember) {
+      await revokeGithubToken(session.token);
       sessionTokens.delete(req.cookies.session_id);
       return res.status(403).send("Access denied");
     }
@@ -94,7 +142,6 @@ app.get("/callback", async (req, res) => {
   }
 
   res.clearCookie("oauth_state");
-  res.clearCookie("code_verifier");
 
   const tokenRes = await fetch("https://github.com/login/oauth/access_token", {
     method: "POST",
@@ -107,6 +154,8 @@ app.get("/callback", async (req, res) => {
     })
   });
 
+  res.clearCookie("code_verifier");
+
   const { access_token } = await tokenRes.json();
   if (!access_token) return res.status(500).send("Token exchange failed");
 
@@ -118,7 +167,8 @@ app.get("/callback", async (req, res) => {
   sessionTokens.set(sessionId, {
     token: access_token,
     expiry: Date.now() + TOKEN_TTL_MS,
-    revealed: false
+    revealed: false,
+    revealExpiry: null
   });
 
   res.cookie("session_id", sessionId, { httpOnly: true, sameSite: "lax", secure: isProduction });
@@ -127,16 +177,9 @@ app.get("/callback", async (req, res) => {
 
 /* ------------------------ Token metadata ------------------------ */
 app.get("/token-data", async (req, res) => {
-  const session = sessionTokens.get(req.cookies.session_id);
-
-  if (!session || session.expiry < Date.now()) {
+  const session = await getValidSession(req);
+  if (!session) {
     return res.status(403).json({ error: "Session expired" });
-  }
-
-  const stillMember = await validateOrgMembership(session.token);
-  if (!stillMember) {
-    sessionTokens.delete(req.cookies.session_id);
-    return res.status(403).json({ error: "Access denied" });
   }
 
   res.json({
@@ -148,16 +191,9 @@ app.get("/token-data", async (req, res) => {
 
 /* ------------------------ One-time reveal ------------------------ */
 app.post("/token/reveal", async (req, res) => {
-  const session = sessionTokens.get(req.cookies.session_id);
-
-  if (!session || session.expiry < Date.now()) {
+  const session = await getValidSession(req);
+  if (!session) {
     return res.status(403).json({ error: "Session expired" });
-  }
-
-  const stillMember = await validateOrgMembership(session.token);
-  if (!stillMember) {
-    sessionTokens.delete(req.cookies.session_id);
-    return res.status(403).json({ error: "Access denied" });
   }
 
   if (session.revealed) {
@@ -165,10 +201,25 @@ app.post("/token/reveal", async (req, res) => {
   }
 
   session.revealed = true;
-  session.expiry = Math.min(session.expiry, Date.now() + REVEAL_TTL_MS);
+  session.revealExpiry = Date.now() + REVEAL_TTL_MS;
 
   res.json({ access_token: session.token });
 });
+
+/* ------------------------ Background cleanup job ------------------------ */
+setInterval(async () => {
+  const now = Date.now();
+
+  for (const [sessionId, session] of sessionTokens.entries()) {
+    if (
+      session.expiry <= now ||
+      (session.revealed && session.revealExpiry && session.revealExpiry <= now)
+    ) {
+      await revokeGithubToken(session.token);
+      sessionTokens.delete(sessionId);
+    }
+  }
+}, 60 * 1000); // every minute
 
 app.listen(PORT, () => {
   console.log(`Server running at http://localhost:${PORT}`);
